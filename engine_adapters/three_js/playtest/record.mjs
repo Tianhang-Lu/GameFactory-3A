@@ -17,7 +17,7 @@ function parseArgs(argv) {
   const out = {};
   const supported = new Set(['url', 'output-dir', 'duration', 'fps', 'width', 'height',
     'playwright-root', 'browser-executable', 'action-plan', 'look', 'warmup', 'hold',
-    'mode', 'allow-partial-plan', 'self-test', 'preview', 'poster', 'source-hash']);
+    'mode', 'allow-partial-plan', 'self-test', 'preview', 'poster', 'source-hash', 'design-revision']);
   for (let i = 2; i < argv.length; i += 1) {
     const key = argv[i].slice(2);
     if (!argv[i].startsWith('--') || !supported.has(key)) throw new Error(`Unknown option: ${argv[i]}`);
@@ -271,6 +271,7 @@ async function selfTest() {
     assert.equal(parseArgs(['node', 'record', '--preview']).preview, 'true');
     assert.equal(parseArgs(['node', 'record', '--poster', '--width', '1280']).poster, 'true');
     assert.equal(parseArgs(['node', 'record', '--source-hash', 'AbC0123'])['source-hash'], 'AbC0123');
+    assert.equal(parseArgs(['node', 'record', '--design-revision', 'design-7'])['design-revision'], 'design-7');
     assert.throws(() => parseArgs(['node', 'record', '--look']), /Missing value/);
     assert.throws(() => parseArgs(['node', 'record', '--typo', 'x']), /Unknown option/);
   });
@@ -410,12 +411,14 @@ async function main(args) {
   const report = {
     schema_version: 'a3game.playtest_report.v1', engine: 'three_js', status: 'failed',
     url: args.url, output_dir: outputDir, source_hash: args['source-hash'] ?? null,
+    design_revision: args['design-revision'] ?? null,
     mode, fps: FPS, requested_seconds: duration,
     viewport: { width, height }, action_source: '', look_mode: '', warmup_seconds: 0,
     sustained: [], excluded_actions: [], actions: [], executed_actions: [], unexecuted_actions: [],
     frames: 0, recorded_seconds: 0, simulated_seconds: 0, fixed_tick: false,
     crash: '', page_errors: [], console_errors: [], warnings: [], video: null,
-    init: null, poster: null, game_state: null, created_at: new Date().toISOString(),
+    init: null, poster: null, game_state: null, entry_state: null,
+    slice: null, slice_validation: null, created_at: new Date().toISOString(),
   };
   let browser;
   let page;
@@ -508,6 +511,14 @@ async function main(args) {
         discovered = Array.isArray(parsed) ? { source: 'plan', actions: parsed } : { ...parsed, source: 'plan' };
       } else discovered = await page.evaluate(DISCOVERY);
     }
+    if (discovered.slice !== undefined && discovered.slice !== null) {
+      if (!discovered.slice || typeof discovered.slice !== 'object' ||
+          !discovered.slice.id || !discovered.slice.chapter_id || discovered.slice.checkpoint === undefined || discovered.slice.checkpoint === null ||
+          !Array.isArray(discovered.slice.acceptance) || !discovered.slice.acceptance.length) {
+        throw new Error('Slice metadata requires id, chapter_id, checkpoint, and acceptance');
+      }
+      report.slice = discovered.slice;
+    }
     report.action_source = discovered.source;
     report.look_mode = lookMode(String(args.look ?? discovered.look ?? 'auto').toLowerCase(), runtime.lookMode);
     if (mode === 'overview' && report.look_mode !== 'off') throw new Error('overview owns its camera; use --look off');
@@ -543,6 +554,49 @@ async function main(args) {
       failOnPageErrors();
     };
 
+    // Slice validation is opt-in. A game must expose these hooks so the
+    // recorder cannot manufacture a normal-path checkpoint or acceptance.
+    const restoreSliceCheckpoint = async (slice) => page.evaluate(async (value) => {
+      const game = globalThis.__A3GAME_GAME__;
+      const api = game?.playtest ?? game?.validation ?? game;
+      const restore = api?.restoreCheckpoint;
+      if (typeof restore !== 'function') return { ok: false, supported: false, finding: 'Game has no restoreCheckpoint hook' };
+      const result = await restore.call(api, value.checkpoint, value);
+      return { ok: result !== false && result?.ok !== false, supported: true,
+        finding: result?.finding || result?.error || '' };
+    }, slice);
+    const validateSlicePhase = async (slice, phase) => page.evaluate(async ({ value, phase: current }) => {
+      const game = globalThis.__A3GAME_GAME__;
+      const api = game?.playtest ?? game?.validation ?? game;
+      const validate = api?.validateSlice;
+      if (typeof validate === 'function') {
+        const result = await validate.call(api, { phase: current, slice: value });
+        return { ok: result === true || result?.ok === true, supported: true,
+          finding: result?.finding || result?.error || '', events: result?.events || [] };
+      }
+      const conditions = current === 'entry'
+        ? (value.entry_conditions || [])
+        : [...(value.exit_conditions || []), ...(value.acceptance || [])];
+      const getState = game?.getState;
+      if (typeof getState !== 'function' || !conditions.length) {
+        return { ok: false, supported: false, finding: 'Game has no validateSlice hook or declarative state conditions' };
+      }
+      const state = getState.call(game);
+      const read = (root, path) => String(path || '').split('.').filter(Boolean).reduce((item, key) => item == null ? undefined : item[key], root);
+      const matches = (condition) => {
+        if (!condition || typeof condition !== 'object' || !condition.path) return false;
+        const actual = read(state, condition.path);
+        if (Object.prototype.hasOwnProperty.call(condition, 'equals')) return JSON.stringify(actual) === JSON.stringify(condition.equals);
+        if (Object.prototype.hasOwnProperty.call(condition, 'not_equals')) return JSON.stringify(actual) !== JSON.stringify(condition.not_equals);
+        if (condition.truthy === true) return Boolean(actual);
+        if (condition.truthy === false) return !actual;
+        if (Array.isArray(condition.one_of)) return condition.one_of.some((item) => JSON.stringify(item) === JSON.stringify(actual));
+        return false;
+      };
+      const failed = conditions.find((condition) => !matches(condition));
+      return { ok: !failed, supported: true, finding: failed ? `State condition failed: ${failed.path || 'unknown'}` : '', events: [] };
+    }, { value: slice, phase });
+
     async function setKeys(wanted) {
       const target = new Set([...wanted, ...sustainedCodes]);
       for (const key of [...held]) {
@@ -577,6 +631,16 @@ async function main(args) {
       report.frames += 1;
     }
     await advance(0, 0);
+    if (report.slice) {
+      const restored = await restoreSliceCheckpoint(report.slice);
+      report.slice_validation = { ok: false, checkpoint_restored: restored.ok, entry: null, exit: null,
+        events: [], finding: restored.finding || '' };
+      if (!restored.supported || !restored.ok) throw new Error(restored.finding || 'Slice checkpoint could not be restored');
+      report.entry_state = await page.evaluate(safeSnapshot);
+      const entry = await validateSlicePhase(report.slice, 'entry');
+      report.slice_validation.entry = entry;
+      if (!entry.supported || !entry.ok) throw new Error(entry.finding || 'Slice entry conditions failed');
+    }
     report.init = path.join(outputDir, 'init.png');
     await screenshot(report.init);
     await setKeys([]);
@@ -616,6 +680,14 @@ async function main(args) {
     report.poster = path.join(outputDir, 'poster.png');
     await screenshot(report.poster);
     report.game_state = await page.evaluate(safeSnapshot);
+    if (report.slice) {
+      const exit = await validateSlicePhase(report.slice, 'exit');
+      report.slice_validation.exit = exit;
+      report.slice_validation.events = exit.events || [];
+      report.slice_validation.ok = Boolean(exit.supported && exit.ok);
+      report.slice_validation.finding = exit.finding || (report.slice_validation.ok ? '' : 'Slice exit conditions failed');
+      if (!report.slice_validation.ok) throw new Error(report.slice_validation.finding);
+    }
     const timing = await page.evaluate(() => {
       const host = globalThis.__A3GAME_GAME__.host;
       return { simulationTime: Number(host.elapsedSeconds ?? 0), droppedSeconds: Number(host.droppedSeconds ?? 0) };
@@ -682,13 +754,16 @@ async function main(args) {
   const reportPath = path.join(outputDir, 'report.json');
   const manifest = {
     schema_version: 'a3game.playtest_manifest.v1', status: report.status, mode, url: args.url,
-    source_hash: report.source_hash,
+    source_hash: report.source_hash, design_revision: report.design_revision,
     output_dir: outputDir, created_at: report.created_at, completed_at: report.completed_at ?? null,
     fps: FPS, frames: report.frames, seconds: report.recorded_seconds, viewport: report.viewport,
     partial_plan: report.partial_plan ?? false, report: path.relative(baseDir, reportPath),
     video: report.video ? path.relative(baseDir, report.video) : null,
     poster: report.poster ? path.relative(baseDir, report.poster) : null,
     init: report.init ? path.relative(baseDir, report.init) : null,
+    slice: report.slice ? { id: report.slice.id, chapter_id: report.slice.chapter_id,
+      checkpoint_restored: Boolean(report.slice_validation?.checkpoint_restored),
+      validation_ok: Boolean(report.slice_validation?.ok) } : null,
   };
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
   await writeFile(path.join(outputDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
@@ -697,7 +772,8 @@ async function main(args) {
     await writeFile(pending, `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
     await rename(pending, path.join(baseDir, 'manifest.json'));
   }
-  console.log(JSON.stringify({ status: report.status, source_hash: report.source_hash, report: reportPath, output_dir: outputDir, poster: report.poster }));
+  console.log(JSON.stringify({ status: report.status, source_hash: report.source_hash,
+    design_revision: report.design_revision, report: reportPath, output_dir: outputDir, poster: report.poster }));
   if (!['completed', 'preview_completed'].includes(report.status)) process.exitCode = 1;
 }
 

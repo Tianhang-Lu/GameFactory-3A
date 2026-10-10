@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .._internal.transport import NodeToolchain
 from ..config import ThreeClientConfig
 from ..contracts import ThreeOperationResult
+from .validation import TestableSlice, ValidationLedger, ValidationRecord, load_slice
 
 _RECORDER = Path(__file__).with_name("record.mjs")
 _OPERATION = "playtest.record"
@@ -85,6 +88,7 @@ class ThreePlaytestClient:
         preview: bool = False,
         allow_partial_plan: bool = False,
         source_hash: str | None = None,
+        design_revision: str | None = None,
     ) -> dict[str, Any]:
         """Capture a unique take below ``output_dir`` without reusing old evidence.
 
@@ -92,7 +96,8 @@ class ThreePlaytestClient:
         Explicit ``warmup=0`` disables pre-roll; ``look=False`` means ``off``.
         ``mode`` is gameplay or overview; ``preview`` captures one PNG instead
         of a video. ``allow_partial_plan`` explicitly permits a plan prefix.
-        ``source_hash`` is an opaque build label passed through unchanged.
+        ``source_hash`` is an opaque build label passed through unchanged;
+        ``design_revision`` identifies the design contract used by evidence.
         Successful videos require completed status and verified video metadata;
         PNG previews require preview_completed. The current report path comes
         only from this invocation's final stdout JSON, never BASE/report.json.
@@ -115,6 +120,8 @@ class ThreePlaytestClient:
             return self._fail("preview and allow_partial_plan must be boolean")
         if source_hash is not None and (not isinstance(source_hash, str) or not source_hash):
             return self._fail("source_hash must be a non-empty string or None")
+        if design_revision is not None and (not isinstance(design_revision, str) or not design_revision):
+            return self._fail("design_revision must be a non-empty string or None")
 
         out = Path(output_dir).expanduser().resolve(strict=False)
         plan = self._resolve(action_plan)
@@ -162,6 +169,8 @@ class ThreePlaytestClient:
             arguments.append("--allow-partial-plan")
         if source_hash is not None:
             arguments.extend(["--source-hash", source_hash])
+        if design_revision is not None:
+            arguments.extend(["--design-revision", design_revision])
         if held:
             arguments.extend(["--hold", ",".join(held)])
         for flag, value in (
@@ -194,6 +203,7 @@ class ThreePlaytestClient:
             "preview": preview,
             "allow_partial_plan": allow_partial_plan,
             "source_hash": source_hash,
+            "design_revision": design_revision,
             "arguments": arguments,
             "action_plan": str(plan) if plan else None,
             "hold": held,
@@ -245,6 +255,8 @@ class ThreePlaytestClient:
                 raise ValueError("Report output_dir does not match the current take")
             if report.get("source_hash") != source_hash or current.get("source_hash") != source_hash:
                 raise ValueError("Recorder source_hash does not match this invocation")
+            if report.get("design_revision") != design_revision or current.get("design_revision") != design_revision:
+                raise ValueError("Recorder design_revision does not match this invocation")
             if report.get("mode") != mode or report.get("url") != url:
                 raise ValueError("Recorder mode or URL does not match this invocation")
             expected_status = "preview_completed" if preview else "completed"
@@ -304,6 +316,112 @@ class ThreePlaytestClient:
             warnings=[str(item) for item in report.get("warnings", [])],
             payload=payload,
         ).to_dict()
+
+    def record_slice(
+        self,
+        *,
+        slice_spec: TestableSlice | Mapping[str, Any] | str | Path,
+        output_dir: str | Path,
+        design_revision: str,
+        validation_id: str | None = None,
+        dependency_refs: list[str] | None = None,
+        ledger_path: str | Path | None = None,
+        owning_task: str = "",
+        **record_options: Any,
+    ) -> dict[str, Any]:
+        """Record one independently recoverable slice and optionally update a ledger.
+
+        The action plan is derived from ``slice.operations`` and carries the
+        checkpoint and acceptance contract into the browser. A slice run is
+        considered passing only when the recorder completes and the game's
+        optional playtest validation hook confirms its entry and exit state.
+        """
+        try:
+            slice_value = load_slice(slice_spec)
+            revision = str(design_revision or "").strip()
+            if not revision:
+                raise ValueError("design_revision must be a non-empty string")
+            if slice_value.checkpoint is None:
+                raise ValueError("slice.checkpoint is required for slice validation")
+            refs = [str(item).strip() for item in (dependency_refs or []) if str(item).strip()]
+            if not refs:
+                refs = list(dict.fromkeys(slice_value.task_refs + slice_value.asset_refs + slice_value.screen_refs))
+            if not refs:
+                raise ValueError("dependency_refs must identify the inputs used by the slice")
+            base = Path(output_dir).expanduser().resolve(strict=False)
+            base.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".slice-plan.json",
+                prefix=f"{slice_value.id}-", dir=base, delete=False,
+            ) as handle:
+                plan_path = Path(handle.name)
+                json.dump({
+                    "slice": slice_value.to_dict(),
+                    "actions": slice_value.operations,
+                }, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            try:
+                result = self.record(
+                    output_dir=base,
+                    action_plan=plan_path,
+                    design_revision=revision,
+                    **record_options,
+                )
+            finally:
+                plan_path.unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError) as exc:
+            return self._fail(str(exc))
+
+        payload = result.setdefault("payload", {})
+        report = payload.get("report") or {}
+        slice_validation = report.get("slice_validation") or {}
+        passed = bool(result.get("ok")) and report.get("status") == "completed" and bool(
+            slice_validation.get("ok", False)
+        )
+        evidence = [
+            {"type": item.get("type"), "path": item.get("path")}
+            for item in result.get("artifacts", [])
+            if isinstance(item, Mapping) and item.get("path")
+        ]
+        record = ValidationRecord(
+            validation_id=str(validation_id or f"{slice_value.id}:{revision}:{uuid.uuid4().hex[:12]}"),
+            slice_id=slice_value.id,
+            chapter_id=slice_value.chapter_id,
+            design_revision=revision,
+            dependency_refs=refs,
+            covered_requirement_ids=list(slice_value.requirement_ids),
+            covered_beat_ids=list(slice_value.beat_ids),
+            entry_checkpoint=slice_value.checkpoint,
+            operations_exercised=list(report.get("executed_actions") or []),
+            result="pass" if passed else ("blocked" if report.get("status") != "completed" else "fail"),
+            evidence=evidence,
+            finding="" if passed else str(
+                slice_validation.get("finding") or report.get("crash") or result.get("errors") or "Slice acceptance failed"
+            ),
+            owning_task=owning_task,
+            branch_id=slice_value.branch_id,
+        )
+        payload["validation"] = record.to_dict()
+        report["validation"] = record.to_dict()
+        report_path = payload.get("report_path")
+        if report_path:
+            try:
+                report_file = Path(report_path).resolve(strict=True)
+                report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            except (OSError, TypeError, ValueError) as exc:
+                return self._fail(f"Could not persist validation evidence metadata: {exc}", payload)
+        if ledger_path:
+            try:
+                ledger_file = Path(ledger_path).expanduser().resolve(strict=False)
+                ledger = ValidationLedger.load(ledger_file) if ledger_file.is_file() else ValidationLedger(design_revision=revision)
+                ledger.update_design_revision(revision)
+                ledger.add_slice(slice_value)
+                ledger.add_validation(record)
+                ledger.save(ledger_file)
+                payload["ledger_path"] = str(ledger_file)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                return self._fail(f"Validation ledger update failed: {exc}", payload)
+        return result
 
     @staticmethod
     def _contained_path(value: Any, parent: Path, *, directory: bool = False) -> Path:
